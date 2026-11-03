@@ -90,7 +90,7 @@ void packBytesToBits(const UInt8 * bytes, size_t num_rows, char * out, bool inve
 
 }
 
-void RecordBatchEncoder::appendBuffer(const void * data, size_t length)
+char * RecordBatchEncoder::allocateBuffer(size_t length)
 {
     while (body.size() % 8 != 0)
         body.push_back('\0');
@@ -99,8 +99,28 @@ void RecordBatchEncoder::appendBuffer(const void * data, size_t length)
     if (length > 0)
     {
         body.resize(offset + length);
-        memcpy(body.data() + offset, data, length);
+        return body.data() + offset;
     }
+    return nullptr;
+}
+
+void RecordBatchEncoder::appendBuffer(const void * data, size_t length)
+{
+    if (char * destination = allocateBuffer(length))
+        memcpy(destination, data, length);
+}
+
+void RecordBatchEncoder::appendBorrowedBuffer(const void * data, size_t length)
+{
+    if (settings.arrow.output_compression_method != FormatSettings::ArrowCompression::NONE)
+    {
+        appendBuffer(data, length);
+        return;
+    }
+
+    allocateBuffer(length);
+    if (length)
+        borrowed_buffers.push_back({body.size() - length, static_cast<const char *>(data), length});
 }
 
 void RecordBatchEncoder::appendEmptyBuffer()
@@ -121,44 +141,47 @@ Int64 RecordBatchEncoder::appendValidity(const IColumn * null_map_column, size_t
 
     const size_t num_rows = end - begin;
     const auto & null_map = assert_cast<const ColumnUInt8 &>(*null_map_column).getData();
-    PODArray<char> bitmap((num_rows + 7) / 8, 0);
-    packBytesToBits(null_map.data() + begin, num_rows, bitmap.data(), /*invert=*/true); /// Arrow validity bit: 1 = valid.
-    appendBuffer(bitmap.data(), bitmap.size());
-    return countBytesInFilter(null_map.data(), begin, end);
+    const Int64 null_count = countBytesInFilter(null_map.data(), begin, end);
+    if (null_count == 0)
+    {
+        appendEmptyBuffer();
+        return 0;
+    }
+    const size_t bytes = (num_rows + 7) / 8;
+    char * bitmap = allocateBuffer(bytes);
+    memset(bitmap, 0, bytes);
+    packBytesToBits(null_map.data() + begin, num_rows, bitmap, /*invert=*/true);
+    return null_count;
 }
 
 void RecordBatchEncoder::appendOffsets(const IColumn::Offsets & ch_offsets, size_t begin, size_t end)
 {
     const size_t num_rows = end - begin;
     const UInt64 base = ch_offsets[static_cast<ssize_t>(begin) - 1];
-    PODArray<Int32> arrow_offsets(num_rows + 1);
+    const UInt64 final_offset = ch_offsets[static_cast<ssize_t>(end) - 1] - base;
+    /// The offsets are monotonic, so validating the final one bounds every row in this range.
+    if (final_offset > MAX_ARROW_BUFFER_SIZE)
+        throw Exception(
+            ErrorCodes::TOO_LARGE_ARRAY_SIZE,
+            "Cannot write a row of {} elements to Arrow IPC: `List` offsets are 32-bit, so a single row "
+            "cannot hold more than {} elements",
+            final_offset, MAX_ARROW_BUFFER_SIZE);
+    auto * arrow_offsets = reinterpret_cast<Int32 *>(allocateBuffer((num_rows + 1) * sizeof(Int32)));
     arrow_offsets[0] = 0;
     for (size_t i = 0; i < num_rows; ++i)
-    {
-        const UInt64 offset = ch_offsets[begin + i] - base;
-        /// The row limit bounds the element count of `Array`/`Map` exactly, so only a row too large on its
-        /// own gets here.
-        if (offset > MAX_ARROW_BUFFER_SIZE)
-            throw Exception(
-                ErrorCodes::TOO_LARGE_ARRAY_SIZE,
-                "Cannot write a row of {} elements to Arrow IPC: `List` offsets are 32-bit, so a single row "
-                "cannot hold more than {} elements",
-                offset, MAX_ARROW_BUFFER_SIZE);
-        arrow_offsets[i + 1] = static_cast<Int32>(offset);
-    }
-    appendBuffer(arrow_offsets.data(), (num_rows + 1) * sizeof(Int32));
+        arrow_offsets[i + 1] = static_cast<Int32>(ch_offsets[begin + i] - base);
 }
 
 namespace
 {
 
-/// Appends a fixed-width column's contiguous data straight into the body (a single copy, no temporary).
+/// Borrows a fixed-width column's contiguous data when the output is uncompressed.
 template <typename Col>
 void appendFixedWidth(RecordBatchEncoder & self, const IColumn & column, size_t begin, size_t end)
 {
     using V = typename Col::ValueType;
     const auto & data = assert_cast<const Col &>(column).getData();
-    self.appendBuffer(data.data() + begin, (end - begin) * sizeof(V));
+    self.appendBorrowedBuffer(data.data() + begin, (end - begin) * sizeof(V));
 }
 
 int arrowTimeUnitForScale(UInt32 scale)
@@ -236,10 +259,9 @@ void RecordBatchEncoder::encodeValues(
             }
             /// Date is UInt16 days; widen to Int32 to match Arrow date32.
             const auto & data = assert_cast<const ColumnUInt16 &>(column).getData();
-            PODArray<Int32> widened(num_rows);
+            auto * widened = reinterpret_cast<Int32 *>(allocateBuffer(num_rows * sizeof(Int32)));
             for (size_t i = 0; i < num_rows; ++i)
                 widened[i] = static_cast<Int32>(data[begin + i]);
-            appendBuffer(widened.data(), num_rows * sizeof(Int32));
             return;
         }
         case TypeIndex::DateTime64:
@@ -354,7 +376,7 @@ void RecordBatchEncoder::encodeValues(
         {
             const size_t arrow_width = which.idx == TypeIndex::Decimal256 ? 32 : 16;
             /// Every byte of every slot is written below (value bytes + sign extension), so no zero-init.
-            PODArray<char> out(num_rows * arrow_width);
+            char * out = allocateBuffer(num_rows * arrow_width);
             auto emit = [&](const auto & col)
             {
                 using ValueType = typename std::decay_t<decltype(col)>::ValueType;
@@ -363,7 +385,7 @@ void RecordBatchEncoder::encodeValues(
                 for (size_t i = 0; i < num_rows; ++i)
                 {
                     const char * src = reinterpret_cast<const char *>(&data[begin + i]);
-                    char * dst = out.data() + i * arrow_width;
+                    char * dst = out + i * arrow_width;
                     memcpy(dst, src, ch_width);
                     /// Sign-extend to the wider Arrow representation (little-endian two's complement).
                     const char sign = (src[ch_width - 1] & static_cast<char>(0x80)) ? static_cast<char>(0xFF) : 0;
@@ -377,7 +399,6 @@ void RecordBatchEncoder::encodeValues(
                 case TypeIndex::Decimal128: emit(assert_cast<const ColumnDecimal<Decimal128> &>(column)); break;
                 default: emit(assert_cast<const ColumnDecimal<Decimal256> &>(column)); break;
             }
-            appendBuffer(out.data(), out.size());
             return;
         }
         case TypeIndex::String:
@@ -391,21 +412,18 @@ void RecordBatchEncoder::encodeValues(
             /// before the range already are the Arrow ones.
             const UInt64 base = offs[static_cast<ssize_t>(begin) - 1];
             const UInt64 total_bytes = offs[static_cast<ssize_t>(end) - 1] - base;
-            PODArray<Int32> arrow_offsets(num_rows + 1);
-            arrow_offsets[0] = 0;
-
             if (!null_map)
             {
                 /// The bytes of the whole range are contiguous, so no full-size temporary is needed.
                 if (total_bytes > MAX_ARROW_BUFFER_SIZE)
                     throwValueDoesNotFitArrowBuffer(static_cast<Int64>(total_bytes));
-                for (size_t i = 0; i < num_rows; ++i)
-                    arrow_offsets[i + 1] = static_cast<Int32>(offs[begin + i] - base);
-                appendBuffer(arrow_offsets.data(), (num_rows + 1) * sizeof(Int32));
-                appendBuffer(chars.data() + base, total_bytes);
+                appendOffsets(offs, begin, end);
+                appendBorrowedBuffer(chars.data() + base, total_bytes);
                 return;
             }
 
+            PODArray<Int32> arrow_offsets(num_rows + 1);
+            arrow_offsets[0] = 0;
             PODArray<char> data;
             data.reserve(total_bytes); /// An upper bound: null rows contribute nothing.
             Int64 cur = 0;
@@ -626,6 +644,7 @@ void RecordBatchEncoder::encodeField(const IColumn & column, const DataTypePtr &
     if (isColumnConst(column))
     {
         auto full = column.cut(begin, end - begin)->convertToFullColumnIfConst();
+        source_columns.push_back(full);
         encodeField(*full, type, 0, end - begin);
         return;
     }
@@ -638,6 +657,7 @@ void RecordBatchEncoder::encodeField(const IColumn & column, const DataTypePtr &
     if (column.isReplicated())
     {
         auto full = column.cut(begin, end - begin)->convertToFullColumnIfReplicated();
+        source_columns.push_back(full);
         encodeField(*full, type, 0, end - begin);
         return;
     }
@@ -646,6 +666,7 @@ void RecordBatchEncoder::encodeField(const IColumn & column, const DataTypePtr &
     {
         /// Materialize LowCardinality to its full column (matches output_format_arrow_low_cardinality_as_dictionary=false).
         auto full = column.cut(begin, end - begin)->convertToFullColumnIfLowCardinality();
+        source_columns.push_back(full);
         encodeField(*full, removeLowCardinality(type), 0, end - begin);
         return;
     }
@@ -668,10 +689,9 @@ void RecordBatchEncoder::encodeField(const IColumn & column, const DataTypePtr &
         nested_type = removeNullable(type);
     }
 
-    /// `appendValidity` packs the validity buffer and returns the null count in one pass over the null map.
     const Int64 null_count = appendValidity(null_map_column, begin, end);
     nodes.emplace_back(static_cast<Int64>(end - begin), null_count);
-    encodeValues(*nested, nested_type, begin, end, null_map_column);
+    encodeValues(*nested, nested_type, begin, end, null_count ? null_map_column : nullptr);
 }
 
 void RecordBatchEncoder::encodeVariant(const IColumn & column, const DataTypePtr & type, size_t begin, size_t end)
@@ -747,6 +767,8 @@ RecordBatchEncoder::EncodedBatch RecordBatchEncoder::encode(
     nodes.clear();
     buffers.clear();
     body.clear();
+    borrowed_buffers.clear();
+    source_columns = columns;
 
     const size_t num_rows = end - begin;
 
@@ -775,6 +797,7 @@ RecordBatchEncoder::EncodedBatch RecordBatchEncoder::encode(
         result.nodes = std::move(nodes);
         result.buffers = std::move(buffers);
         result.body = std::move(body);
+        result.borrowed_buffers = std::move(borrowed_buffers);
     }
     else
     {
@@ -836,10 +859,21 @@ RecordBatchEncoder::EncodedBatch RecordBatchEncoder::encode(
             result.body.push_back('\0');
     }
 
-    nodes = {};
-    buffers = {};
-    body = {};
+    result.source_columns = std::move(source_columns);
     return result;
+}
+
+void RecordBatchEncoder::recycle(EncodedBatch batch)
+{
+    nodes = std::move(batch.nodes);
+    buffers = std::move(batch.buffers);
+    if (!batch.codec)
+    {
+        body = std::move(batch.body);
+        borrowed_buffers = std::move(batch.borrowed_buffers);
+    }
+    source_columns = std::move(batch.source_columns);
+    source_columns.clear();
 }
 
 }

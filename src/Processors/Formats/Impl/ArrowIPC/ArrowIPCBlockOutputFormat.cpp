@@ -202,8 +202,23 @@ ArrowIPC::MessageWriter::WrittenMessage ArrowIPCBlockOutputFormat::writeBatchMes
         static_cast<Int64>(batch.body.size()));
     builder.Finish(message);
 
-    return message_writer->writeMessage(
-        builder.GetBufferPointer(), builder.GetSize(), batch.body.data(), batch.body.size());
+    if (batch.borrowed_buffers.empty())
+        return message_writer->writeMessage(
+            builder.GetBufferPointer(), builder.GetSize(), batch.body.data(), batch.body.size());
+
+    auto written = message_writer->writeMessage(builder.GetBufferPointer(), builder.GetSize(), nullptr, 0);
+    size_t offset = 0;
+    for (const auto & buffer : batch.borrowed_buffers)
+    {
+        if (buffer.offset > offset)
+            message_writer->writeRaw(batch.body.data() + offset, buffer.offset - offset);
+        message_writer->writeRaw(buffer.data, buffer.size);
+        offset = buffer.offset + buffer.size;
+    }
+    if (offset < batch.body.size())
+        message_writer->writeRaw(batch.body.data() + offset, batch.body.size() - offset);
+    written.body_length = static_cast<Int64>(batch.body.size());
+    return written;
 }
 
 std::pair<ColumnPtr, DataTypePtr> ArrowIPCBlockOutputFormat::encodeDictionaryColumn(
@@ -259,6 +274,7 @@ std::pair<ColumnPtr, DataTypePtr> ArrowIPCBlockOutputFormat::encodeDictionaryCol
         ColumnPtr delta = state.values->cut(delta_start, delta_size);
         auto dict_batch = encoder->encode({delta}, {value_type}, 0, delta_size);
         auto written = writeBatchMessage(dict_batch, dict.id, /*is_delta=*/state.emitted);
+        encoder->recycle(std::move(dict_batch));
         if (!stream)
             dictionary_blocks.push_back({written.offset, written.metadata_length, written.body_length});
         state.emitted = true;
@@ -358,6 +374,7 @@ void ArrowIPCBlockOutputFormat::writeRecordBatch(
 {
     auto batch = encoder->encode(columns, types, begin, end);
     auto written = writeBatchMessage(batch);
+    encoder->recycle(std::move(batch));
     if (!stream)
         record_blocks.push_back({written.offset, written.metadata_length, written.body_length});
 }
