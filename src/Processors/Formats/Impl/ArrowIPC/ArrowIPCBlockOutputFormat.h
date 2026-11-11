@@ -33,6 +33,11 @@ namespace DB
 /// is on — as an Arrow dictionary-encoded column (a single dictionary per id, extended across batches via deltas).
 /// Each chunk becomes one record batch, except when it holds more data than the 32-bit offsets of the Arrow
 /// IPC buffers can address, in which case it is split across several record batches.
+///
+/// The schema is the format's prefix and the end-of-stream marker its finalization, so `ArrowStream` supports
+/// parallel formatting: each chunk can be encoded by its own formatter instance and the results concatenated
+/// in order. `FormatFactory` keeps it serial when record batches are combined or dictionaries are written,
+/// because both carry state from one chunk to the next.
 class ArrowIPCBlockOutputFormat final : public IOutputFormat
 {
 public:
@@ -41,6 +46,7 @@ public:
     String getName() const override { return "ArrowIPCBlockOutputFormat"; }
 
 private:
+    void writePrefix() override;
     void consume(Chunk) override;
     void finalizeImpl() override;
     void resetFormatterImpl() override;

@@ -379,11 +379,16 @@ void ArrowIPCBlockOutputFormat::writeRecordBatch(
         record_blocks.push_back({written.offset, written.metadata_length, written.body_length});
 }
 
+void ArrowIPCBlockOutputFormat::writePrefix()
+{
+    /// `IOutputFormat` writes the prefix before the first chunk and before finalizing, so the schema leads the
+    /// output even for an empty result. Under parallel formatting the prefix is written by a formatter
+    /// instance of its own, and every chunk by a fresh instance that must write only its record batches.
+    writeSchemaIfNeeded();
+}
+
 void ArrowIPCBlockOutputFormat::consume(Chunk chunk)
 {
-    /// Not in `writeChunk`: a reader gets the schema on the first chunk even when batches are combined.
-    writeSchemaIfNeeded();
-
     const size_t target_rows = format_settings.arrow.output_record_batch_rows;
     const size_t target_bytes = format_settings.arrow.output_record_batch_bytes;
     if (!target_rows && !target_bytes)
@@ -466,9 +471,9 @@ void ArrowIPCBlockOutputFormat::finalizeImpl()
     if (staged.getNumRows())
         writeChunk(std::move(staged));
 
-    /// Make sure even an empty result produces a valid stream/file (schema, then EOS or footer).
-    writeSchemaIfNeeded();
-
+    /// The schema was written by `writePrefix`, which `IOutputFormat` calls before finalizing, so even an empty
+    /// result is a valid stream/file. Writing it here again would duplicate it under parallel formatting, where
+    /// finalization runs in a fresh formatter instance.
     if (stream)
     {
         message_writer->writeEOS();
@@ -524,6 +529,10 @@ void registerOutputFormatArrow(FormatFactory & factory)
         });
     factory.markFormatHasNoAppendSupport("ArrowStream");
     factory.markOutputFormatPrefersLargeBlocks("ArrowStream");
+    /// Record batches are independent messages between the schema (prefix) and the end-of-stream marker, so
+    /// chunks can be encoded in parallel and written in order. The `Arrow` file format stays serial: its footer
+    /// records the offset of every batch.
+    factory.markOutputFormatSupportsParallelFormatting("ArrowStream");
     factory.markOutputFormatNotTTYFriendly("ArrowStream");
     factory.setContentType("ArrowStream", "application/octet-stream");
 }
