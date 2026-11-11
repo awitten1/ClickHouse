@@ -1,4 +1,5 @@
 #include <Server/HTTP/WriteBufferFromHTTPServerResponse.h>
+#include <base/scope_guard.h>
 #include <Server/HTTP/exceptionCodeToHTTPStatus.h>
 #include <IO/HTTPCommon.h>
 #include <IO/Progress.h>
@@ -122,6 +123,29 @@ void WriteBufferFromHTTPServerResponse::finishSendHeaders()
     headers_finished_sending = true;
 }
 
+
+void WriteBufferFromHTTPServerResponse::writeDirect(const char * data, size_t size)
+{
+    /// Copying a small block is cheaper than sending it on its own, and a fixed-length body may have to cut
+    /// the data, which only the buffered path does.
+    static constexpr size_t min_direct_write_size = 64 * 1024;
+    if (size < min_direct_write_size || HTTPWriteBuffer::isFixedLength() || isCanceled())
+    {
+        write(data, size);
+        return;
+    }
+
+    /// Send what is already buffered first, so the bytes stay in order.
+    next();
+
+    /// Present the caller's bytes as this buffer's contents and flush them through the usual path, so the
+    /// headers, chunk framing, HEAD requests, byte counts and profile events stay exactly as for a flush.
+    /// Nothing on that path writes into the buffer: headers and chunk framing go straight to the socket.
+    const Buffer own_memory = internalBuffer();
+    SCOPE_EXIT({ set(own_memory.begin(), own_memory.size(), 0); });
+    set(const_cast<char *>(data), size, size);
+    next();
+}
 
 void WriteBufferFromHTTPServerResponse::nextImpl()
 {

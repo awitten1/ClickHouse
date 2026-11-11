@@ -5,6 +5,7 @@
 #include <IO/HTTPCommon.h>
 #include <IO/Progress.h>
 #include <IO/WriteBuffer.h>
+#include <IO/WriteBufferWithDirectWrite.h>
 #include <Server/HTTP/HTTPServerResponse.h>
 #include <Poco/Net/StreamSocket.h>
 #include <Common/NetException.h>
@@ -22,7 +23,7 @@ namespace DB
 /// Also this class write and flush special X-ClickHouse-Progress HTTP headers
 ///  if no data was sent at the time of progress notification.
 /// This allows to implement progress bar in HTTP clients.
-class WriteBufferFromHTTPServerResponse final : public HTTPWriteBuffer
+class WriteBufferFromHTTPServerResponse final : public HTTPWriteBuffer, public IWriteBufferWithDirectWrite
 {
 public:
     static constexpr std::string_view EXCEPTION_MARKER = "__exception__";
@@ -37,6 +38,11 @@ public:
 
     /// Writes progress in repeating HTTP headers.
     void onProgress(const Progress & progress, ContextPtr context);
+
+    /// Sends a large block straight from `data` as its own piece of the body (one HTTP chunk when chunked),
+    /// through the same path as a buffer flush. Used by parallel formatting to avoid copying every formatted
+    /// unit into this buffer.
+    void writeDirect(const char * data, size_t size) override;
 
     /// Turn CORS on or off.
     /// The setting has any effect only if HTTP headers haven't been sent yet.

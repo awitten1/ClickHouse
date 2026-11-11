@@ -1,5 +1,6 @@
 #include <Processors/Formats/Impl/ParallelFormattingOutputFormat.h>
 
+#include <IO/WriteBufferWithDirectWrite.h>
 #include <Processors/Port.h>
 #include <Common/scope_guard_safe.h>
 #include <Common/setThreadName.h>
@@ -142,6 +143,10 @@ namespace DB
     {
         ThreadGroupSwitcher switcher(thread_group, ThreadName::PARALLEL_FORMATER_COLLECTOR);
 
+        /// An output buffer that can send a unit from the unit's own memory (the HTTP response) saves copying
+        /// every formatted unit into it, which is otherwise much of this thread's work.
+        auto * direct_out = dynamic_cast<IWriteBufferWithDirectWrite *>(&out);
+
         try
         {
             while (!emergency_stop)
@@ -164,7 +169,10 @@ namespace DB
                 auto copy_of_unit_type = unit.type;
 
                 /// Do main work here.
-                out.write(unit.segment.data(), unit.actual_memory_size);
+                if (direct_out)
+                    direct_out->writeDirect(unit.segment.data(), unit.actual_memory_size);
+                else
+                    out.write(unit.segment.data(), unit.actual_memory_size);
 
                 if (auto_flush || need_flush.exchange(false) || unit.type == ProcessingUnitType::FINALIZE)
                     out.next();
