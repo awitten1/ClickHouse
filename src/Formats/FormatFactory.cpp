@@ -844,6 +844,18 @@ static void addExistingProgressToOutputFormat(OutputFormatPtr format, const Cont
     }
 }
 
+/// `ParallelFormattingOutputFormat` encodes every chunk with a fresh formatter, so a format that carries state
+/// from one chunk to the next under some settings must stay serial with those settings.
+static bool outputFormatSettingsAllowParallelFormatting(const String & name, const FormatSettings & format_settings)
+{
+    /// ArrowStream: combining small blocks into larger record batches, and dictionaries extended across
+    /// batches by deltas, both span chunks.
+    if (boost::algorithm::to_lower_copy(name) == "arrowstream")
+        return !format_settings.arrow.output_record_batch_rows && !format_settings.arrow.output_record_batch_bytes
+            && !format_settings.arrow.low_cardinality_as_dictionary;
+    return true;
+}
+
 OutputFormatPtr FormatFactory::getOutputFormatParallelIfPossible(
     const String & name,
     WriteBuffer & buf,
@@ -860,7 +872,8 @@ OutputFormatPtr FormatFactory::getOutputFormatParallelIfPossible(
     const Settings & settings = context->getSettingsRef();
 
     if (settings[Setting::output_format_parallel_formatting] && getCreators(name).supports_parallel_formatting
-        && !settings[Setting::output_format_json_array_of_rows])
+        && !settings[Setting::output_format_json_array_of_rows]
+        && outputFormatSettingsAllowParallelFormatting(name, format_settings))
     {
         auto formatter_creator = [output_getter, sample, format_settings, format_filter_info] (WriteBuffer & output) -> OutputFormatPtr
         {
